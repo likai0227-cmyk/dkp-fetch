@@ -1,0 +1,104 @@
+name: fetch-devkitpro
+
+# 用 GitHub 的服务器（美国 IP，不被 Cloudflare 封）把 devkitPro 的 macOS 包下载下来，
+# 打包成 artifact，你在本机下载。
+#
+# 用法：把本文件放到任意一个你自己仓库的 .github/workflows/ 下，
+#       然后在 Actions 页面点 "Run workflow"。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download devkitPro packages for macOS arm64
+        run: |
+          set -e
+          mkdir -p out
+          cd out
+
+          python3 - <<'PY'
+          import io, os, re, tarfile, urllib.request
+
+          REPOS = [
+              ("libs", "https://pkg.devkitpro.org/packages", "dkp-libs.db"),
+              ("osx",  "https://pkg.devkitpro.org/packages/osx/arm64", "dkp-osx.db"),
+          ]
+          # 需要安装的根包（多写几个兜底：switch-dev 可能是 meta 包或组）
+          ROOTS = [
+              "switch-dev", "deko3d",
+              "libnx", "switch-tools", "switch-pkg-config",
+              "devkitA64", "general-tools", "switch-cmake",
+              "devkitarm-rules", "switch-mesa", "switch-glfw",
+          ]
+
+          pkgs = {}   # name -> dict(server, filename, depends)
+
+          for tag, server, dbname in REPOS:
+              url = f"{server}/{dbname}"
+              print(f"== {url}")
+              data = urllib.request.urlopen(url, timeout=120).read()
+              with tarfile.open(fileobj=io.BytesIO(data)) as tf:
+                  descs = [n for n in tf.getnames() if n.endswith("/desc")]
+                  for name in descs:
+                      txt = tf.extractfile(name).read().decode("utf-8", "replace")
+                      fields, cur = {}, None
+                      for line in txt.splitlines():
+                          if line.startswith("%") and line.endswith("%"):
+                              cur = line.strip("%")
+                              fields[cur] = []
+                          elif line.strip() and cur:
+                              fields[cur].append(line.strip())
+                      pname = (fields.get("NAME") or [None])[0]
+                      if not pname:
+                          continue
+                      pkgs[pname] = {
+                          "server": server,
+                          "filename": (fields.get("FILENAME") or [None])[0],
+                          "depends": fields.get("DEPENDS") or [],
+                          "arch": (fields.get("ARCH") or [None])[0],
+                      }
+          print(f"   已知包 {len(pkgs)} 个")
+
+          # 依赖闭包
+          need, stack = set(), list(ROOTS)
+          while stack:
+              n = stack.pop()
+              if n in need or n not in pkgs:
+                  if n not in pkgs:
+                      print(f"   (跳过未收录的依赖 {n})")
+                  continue
+              need.add(n)
+              for d in pkgs[n]["depends"]:
+                  d = re.split(r"[<>=]", d)[0].strip()
+                  if d and d not in need:
+                      stack.append(d)
+
+          print(f"== 需要下载 {len(need)} 个包")
+
+          for n in sorted(need):
+              p = pkgs[n]
+              if not p["filename"]:
+                  print(f"   {n}: 无 FILENAME，跳过")
+                  continue
+              url = f"{p['server']}/{p['filename']}"
+              dst = p["filename"]
+              if os.path.exists(dst):
+                  continue
+              print(f"   {n} <- {url}")
+              urllib.request.urlretrieve(url, dst)
+
+          print("== 完成")
+          PY
+
+          ls -la
+          du -sh .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devkitpro-macos-arm64
+          path: out
+          retention-days: 7
+          compression-level: 0
